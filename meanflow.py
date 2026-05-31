@@ -181,8 +181,14 @@ class MeanFlowTSE:
     def loss_alpha_flow(self, model, source, background, enrollment, alpha):
         """
         Alpha-Flow loss for alpha ∈ (0, 1).
-        Interpolates between trajectory flow matching and consistency training.
-        
+        Interpolates between trajectory flow matching (alpha=1) and
+        consistency training (alpha→0).
+
+        The intermediate point is advanced along the ground-truth trajectory
+        (velocity v = source - background), and the target mixes that true
+        velocity with the model's bootstrapped prediction from s to r:
+            target = alpha * v + (1 - alpha) * u_sr
+
         Args:
             model: The neural network model
             source: Clean source (t=1)
@@ -197,62 +203,52 @@ class MeanFlowTSE:
         mu, sigma = -0.4, 1.0
         normal_samples = np.random.randn(batch_size, 2).astype(np.float32) * sigma + mu
         samples = 1 / (1 + np.exp(-normal_samples))  # sigmoid
-        
+
         # Ensure r >= t (r is the target, ahead in flow)
         t_np = np.minimum(samples[:, 0], samples[:, 1])
         r_np = np.maximum(samples[:, 0], samples[:, 1])
-        
+
         t = torch.tensor(t_np, device=device)
         r = torch.tensor(r_np, device=device)
-        
-        # Sample intermediate point s using alpha
+
+        # Intermediate time s = alpha * r + (1 - alpha) * t
         s = alpha * r + (1 - alpha) * t
 
         # Reshape time variables
         if self.data_dim == '1d':
             t_ = rearrange(t, "b -> b 1 1")
             s_ = rearrange(s, "b -> b 1 1")
-            r_ = rearrange(r, "b -> b 1 1")
         else:
             t_ = rearrange(t, "b -> b 1 1 1")
             s_ = rearrange(s, "b -> b 1 1 1")
-            r_ = rearrange(r, "b -> b 1 1 1")
 
-        # Get point at time t
+        # Point at time t and the ground-truth velocity
         x_t = (1 - t_) * background + t_ * source
-        
-        # Predict velocity from t to s
-        u2 = model(x_t, t, s, enrollment=enrollment)
-        
-        # Move to intermediate point s
-        x_s = x_t + (s_ - t_) * u2
-        
-        # Predict velocity from s to r
-        u1 = model(x_s, s, r, enrollment=enrollment)
-        
-        # Predict direct velocity from t to r
+        v = source - background
+
+        # Direct prediction from t to r
         u_tr = model(x_t, t, r, enrollment=enrollment)
-        
-        # Compute interpolated target
-        lambda_val = (s - t) / (r - t + 1e-8)
-        if self.data_dim == '1d':
-            lambda_ = rearrange(lambda_val, "b -> b 1 1")
-        else:
-            lambda_ = rearrange(lambda_val, "b -> b 1 1 1")
-        
-        target_u = (1 - lambda_) * u1 + lambda_ * u2
-        
+
+        # Advance to s along the true trajectory, then predict from s to r
+        z_s = x_t + (s_ - t_) * v
+        u_sr = model(z_s, s, r, enrollment=enrollment)
+
+        # Target: mix true velocity with the bootstrapped prediction
+        target_u = alpha * v + (1 - alpha) * u_sr
+
         # Compute loss
         error = u_tr - stopgrad(target_u)
         loss = adaptive_l2_loss(error, gamma=self.gamma, alpha=alpha)
         mse_val = (error ** 2).mean()
-        
+
         return loss, mse_val
 
     def loss_alpha_flow_alpha1(self, model, source, background, enrollment, alpha):
         """
         Special case of Alpha-Flow when alpha=1 (reduces to trajectory flow matching).
-        
+        Since s = r, the bootstrap term drops out and a single forward pass
+        regresses the model onto the ground-truth velocity v = source - background.
+
         Args:
             model: The neural network model
             source: Clean source (t=1)
@@ -267,39 +263,32 @@ class MeanFlowTSE:
         mu, sigma = -0.4, 1.0
         normal_samples = np.random.randn(batch_size, 2).astype(np.float32) * sigma + mu
         samples = 1 / (1 + np.exp(-normal_samples))  # sigmoid
-        
+
         # Ensure r >= t
         t_np = np.minimum(samples[:, 0], samples[:, 1])
         r_np = np.maximum(samples[:, 0], samples[:, 1])
-        
+
         t = torch.tensor(t_np, device=device)
         r = torch.tensor(r_np, device=device)
-        
-        # When alpha=1, s=r (direct jump)
-        s = r.clone()
 
         # Reshape time variables
         if self.data_dim == '1d':
             t_ = rearrange(t, "b -> b 1 1")
-            r_ = rearrange(r, "b -> b 1 1")
         else:
             t_ = rearrange(t, "b -> b 1 1 1")
-            r_ = rearrange(r, "b -> b 1 1 1")
 
-        # Get point at time t
+        # Point at time t
         x_t = (1 - t_) * background + t_ * source
-        
-        # Predict direct velocity from t to r
+
+        # Direct prediction from t to r, regressed onto the true velocity
         u_tr = model(x_t, t, r, enrollment=enrollment)
-        
-        # Ground truth velocity
-        v_true = source - background
-        
+        v = source - background
+
         # Compute loss
-        error = u_tr - v_true
+        error = u_tr - v
         loss = adaptive_l2_loss(error, gamma=self.gamma, alpha=alpha)
         mse_val = (error ** 2).mean()
-        
+
         return loss, mse_val
     
     def loss(self, model, source, background, enrollment, iteration=None):
