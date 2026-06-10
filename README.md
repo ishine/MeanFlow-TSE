@@ -1,4 +1,4 @@
-# MeanFlow-TSE: One-Step Generative Target Speaker Extraction with Mean Flow
+# MeanFlow-TSE: One-Step Generative Target Speaker Extraction with Mean Flow (Accepted to Interspeech 2026)
 
 ## Overview
 
